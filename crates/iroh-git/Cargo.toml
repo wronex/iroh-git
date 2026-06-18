@@ -1,0 +1,27 @@
+[package]
+name = "iroh-git"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+iroh.workspace = true
+serde.workspace = true
+postcard.workspace = true
+toml.workspace = true
+data-encoding.workspace = true
+directories.workspace = true
+anyhow.workspace = true
+getrandom.workspace = true
+zeroize.workspace = true
+tokio.workspace = true
+
+# Used only to tighten the DACL on the secret-key files on Windows, where there
+# is no Unix mode bit to set. See identity::restrict_file.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_System_Threading",
+] }
