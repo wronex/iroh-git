@@ -60,7 +60,7 @@ Use `git iroh grant <node_id> [--write] [--name <name>]` to grant access to the 
 
 Revoke a member's access with `git iroh revoke <node_id>`. This removes the member from the repository in the current directory. Append `--write` to revoke their write access only, leaving read access intact. Append `--all` to remove the member from every repository you share, not just the one in the current directory.
 
-Stop sharing an entire repository with `git iroh stop <share_id>`, using the SHARE_ID shown in `git iroh list`. This works from any directory. Pass `--all` instead of a SHARE_ID to stop sharing every repository at once.
+Stop sharing an entire repository with `git iroh stop <share_id>`, using the SHARE_ID shown in `git iroh list`. This works from any directory. Pass `--this` instead of a SHARE_ID to stop sharing the repository in the current directory, or `--all` to stop sharing every repository at once.
 
 ## Limitations
 

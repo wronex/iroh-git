@@ -66,12 +66,15 @@ enum Cmd {
     },
     /// Stop sharing a repository entirely.
     ///
-    /// Removes the repository and all its members from anywhere. Identify the
-    /// repository by its SHARE_ID (from `list`), or pass --all to stop sharing
-    /// everything.
+    /// Removes the repository and all its members. Identify the repository by its
+    /// SHARE_ID (from `list`), pass --this for the repository in the current
+    /// directory, or pass --all to stop sharing everything.
     Stop {
-        /// The repository's SHARE_ID (from `list`). Omit when using --all.
+        /// The repository's SHARE_ID (from `list`). Omit when using --this/--all.
         share_id: Option<String>,
+        /// Stop sharing the repository in the current directory.
+        #[arg(long)]
+        this: bool,
         /// Stop sharing every repository.
         #[arg(long)]
         all: bool,
@@ -89,7 +92,7 @@ fn main() -> Result<()> {
         Cmd::Keygen { client, server, force } => keygen(client, server, force)?,
         Cmd::Grant { node_id, write, name } => grant(&node_id, write, name.as_deref().unwrap_or(""))?,
         Cmd::Revoke { node_id, write, all } => revoke(&node_id, write, all)?,
-        Cmd::Stop { share_id, all } => stop(share_id.as_deref(), all)?,
+        Cmd::Stop { share_id, this, all } => stop(share_id.as_deref(), this, all)?,
         Cmd::List => list()?,
     }
     Ok(())
@@ -166,27 +169,36 @@ fn revoke(node_id: &str, write_only: bool, all: bool) -> Result<()> {
     Ok(())
 }
 
-fn stop(share_id: Option<&str>, all: bool) -> Result<()> {
-    match (share_id, all) {
-        (Some(_), true) => bail!("pass either a SHARE_ID or --all, not both"),
-        (None, false) => {
-            bail!("give a SHARE_ID (from `list`), or pass --all to stop sharing every repository")
+fn stop(share_id: Option<&str>, this: bool, all: bool) -> Result<()> {
+    let selectors = share_id.is_some() as u8 + this as u8 + all as u8;
+    if selectors > 1 {
+        bail!("pass only one of a SHARE_ID, --this, or --all");
+    }
+    if selectors == 0 {
+        bail!("give a SHARE_ID (from `list`), or pass --this for the current repository or --all for every repository");
+    }
+
+    if all {
+        let n = share::unshare_all()?;
+        if n == 0 {
+            eprintln!("no shared repositories");
+        } else {
+            eprintln!("stopped sharing {}", repos(n));
         }
-        (None, true) => {
-            let n = share::unshare_all()?;
-            if n == 0 {
-                eprintln!("no shared repositories");
-            } else {
-                eprintln!("stopped sharing {}", repos(n));
-            }
+    } else if this {
+        let repo_path = share::resolve_repo(Path::new("."))?;
+        if share::unshare(&repo_path)? {
+            eprintln!("stopped sharing {repo_path}");
+        } else {
+            bail!("this repository isn't shared");
         }
-        (Some(id), false) => {
-            let repo_id = RepoId::parse(id).with_context(|| format!("invalid SHARE_ID {id:?}"))?;
-            if share::unshare_by_id(repo_id)? {
-                eprintln!("stopped sharing the repository with id {id}");
-            } else {
-                bail!("no shared repository with id {id}");
-            }
+    } else {
+        let id = share_id.expect("exactly one selector is set");
+        let repo_id = RepoId::parse(id).with_context(|| format!("invalid SHARE_ID {id:?}"))?;
+        if share::unshare_by_id(repo_id)? {
+            eprintln!("stopped sharing the repository with id {id}");
+        } else {
+            bail!("no shared repository with id {id}");
         }
     }
     Ok(())
