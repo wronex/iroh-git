@@ -2,8 +2,35 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
+
+/// Creation flag that suppresses a new console window on Windows.
+#[cfg(windows)]
+pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Suppress the console window a child process would otherwise pop on Windows
+/// (e.g. when a GUI app like the tray spawns git). No-op on other platforms.
+pub fn no_console(cmd: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    let _ = cmd;
+}
+
+/// Build `git -C <repo> …` with stdin closed and no console window — the form
+/// every helper in the workspace uses to shell out to git. Closing stdin keeps a
+/// spawned git from blocking on an inherited handle.
+pub fn git_command(repo: &Path) -> Command {
+    let mut cmd = Command::new(git_program());
+    cmd.arg("-C").arg(repo).stdin(Stdio::null());
+    no_console(&mut cmd);
+    cmd
+}
 
 /// Resolve the `git` executable to an absolute path.
 ///

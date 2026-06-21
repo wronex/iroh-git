@@ -15,6 +15,8 @@ anyhow.workspace = true
 getrandom.workspace = true
 zeroize.workspace = true
 tokio.workspace = true
+sha2.workspace = true
+hex.workspace = true
 
 # Used only to tighten the DACL on the secret-key files on Windows, where there
 # is no Unix mode bit to set. See identity::restrict_file.

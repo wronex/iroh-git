@@ -37,6 +37,12 @@ pub struct RepoGrant {
     pub id: String,
     /// Absolute path to the repository on disk.
     pub path: String,
+    /// Whether this repository serves/accepts Git LFS objects over iroh. Off by
+    /// default; flipped by `git iroh lfs-enable`. Declared before `members` so it
+    /// serializes as a scalar ahead of the `[[repo.member]]` tables (TOML requires
+    /// a table's scalar keys to precede its sub-tables).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub lfs_enabled: bool,
     #[serde(default, rename = "member")]
     pub members: Vec<Member>,
 }
@@ -50,6 +56,16 @@ pub struct Member {
     pub nickname: String,
     #[serde(default)]
     pub allow_push: bool,
+    /// Whether this member may transfer Git LFS objects: download requires this,
+    /// upload requires this and `allow_push`. Granted separately with
+    /// `git iroh grant --lfs`, on top of the per-repo `lfs_enabled` switch.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_lfs: bool,
+}
+
+/// serde `skip_serializing_if` helper: keep `false` bools out of the grants file.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Path to the grants file.
@@ -105,6 +121,7 @@ impl Grants {
         self.repos.push(RepoGrant {
             id: RepoId::random()?.to_string(),
             path: path.to_string(),
+            lfs_enabled: false,
             members: Vec::new(),
         });
         Ok(self.repos.last_mut().expect("just pushed"))
@@ -140,15 +157,35 @@ pub enum RevokeWriteOutcome {
     NotAMember,
 }
 
+/// Result of [`RepoGrant::revoke_lfs`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum RevokeLfsOutcome {
+    Revoked,
+    AlreadyNoLfs,
+    NotAMember,
+}
+
 impl RepoGrant {
     /// Grant access to `node_id`. Additive: a read-only grant on an existing
-    /// member leaves write access intact; `write` only ever raises access. A
-    /// non-empty `nickname` updates the member's label.
-    pub fn grant_member(&mut self, node_id: &str, write: bool, nickname: &str) -> GrantOutcome {
+    /// member leaves write access intact; `write` and `lfs` only ever raise
+    /// access, never lower it. A non-empty `nickname` updates the member's label.
+    /// The returned [`GrantOutcome`] reflects the read/write transition; the `lfs`
+    /// change (if any) is applied as a side effect — callers read the resulting
+    /// `allow_lfs` to report it.
+    pub fn grant_member(
+        &mut self,
+        node_id: &str,
+        write: bool,
+        lfs: bool,
+        nickname: &str,
+    ) -> GrantOutcome {
         match self.members.iter_mut().find(|m| m.node_id == node_id) {
             Some(m) => {
                 if !nickname.is_empty() {
                     m.nickname = nickname.to_string();
+                }
+                if lfs {
+                    m.allow_lfs = true;
                 }
                 if write && !m.allow_push {
                     m.allow_push = true;
@@ -162,6 +199,7 @@ impl RepoGrant {
                     node_id: node_id.to_string(),
                     nickname: nickname.to_string(),
                     allow_push: write,
+                    allow_lfs: lfs,
                 });
                 if write {
                     GrantOutcome::AddedWrite
@@ -191,6 +229,18 @@ impl RepoGrant {
             Some(m) => {
                 m.allow_push = false;
                 RevokeWriteOutcome::Downgraded
+            }
+        }
+    }
+
+    /// Revoke only LFS access from `node_id`, keeping clone/push access.
+    pub fn revoke_lfs(&mut self, node_id: &str) -> RevokeLfsOutcome {
+        match self.members.iter_mut().find(|m| m.node_id == node_id) {
+            None => RevokeLfsOutcome::NotAMember,
+            Some(m) if !m.allow_lfs => RevokeLfsOutcome::AlreadyNoLfs,
+            Some(m) => {
+                m.allow_lfs = false;
+                RevokeLfsOutcome::Revoked
             }
         }
     }

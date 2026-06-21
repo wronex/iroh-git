@@ -13,7 +13,14 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// Handshake protocol version.
 pub const VERSION: u8 = 0;
 
-/// Upper bound on a framed handshake message, to bound allocation.
+/// Version of the LFS sub-protocol spoken over [`crate::LFS_ALPN`]. Independent
+/// of [`VERSION`]: LFS rides a separate ALPN, so it can evolve without touching
+/// the frozen pack handshake that released `git-remote-iroh` clients speak.
+pub const LFS_VERSION: u8 = 0;
+
+/// Upper bound on a framed handshake message, to bound allocation. Only the small
+/// LFS request/response frames are length-prefixed; object bodies stream raw and
+/// are not bound by this.
 const MAX_FRAME: usize = 64 * 1024;
 
 /// Which git service the caller wants.
@@ -88,4 +95,54 @@ where
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf).await?;
     postcard::from_bytes(&buf).context("decoding message")
+}
+
+// --- Git LFS sub-protocol -------------------------------------------------
+//
+// Spoken over [`crate::LFS_ALPN`], one object per bidirectional stream. Entirely
+// separate from the pack handshake above so the released pack wire is frozen.
+//
+// Download: client sends [`LfsRequest`] (`op = Download`); the daemon replies
+// [`LfsResponse::Proceed`] then streams the raw object bytes and finishes the
+// stream, or [`LfsResponse::Error`] if the object is absent.
+//
+// Upload: client sends [`LfsRequest`] (`op = Upload`, with `size`); the daemon
+// replies [`LfsResponse::Have`] (object already present, skip the body),
+// [`LfsResponse::Error`] (not authorized), or [`LfsResponse::Proceed`] (send the
+// body). After the client streams `size` bytes and finishes its half, the daemon
+// verifies the sha256 and replies a final [`LfsResponse::Proceed`] (stored) or
+// [`LfsResponse::Error`] (mismatch).
+
+/// Which LFS transfer the client wants on this stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LfsOp {
+    /// Fetch one object from the daemon's store.
+    Download,
+    /// Store one object into the daemon's store (requires push access).
+    Upload,
+}
+
+/// Opens an LFS transfer for a single content-addressed object.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LfsRequest {
+    pub version: u8,
+    pub repo_id: [u8; 16],
+    pub op: LfsOp,
+    /// Bare 64-hex sha256 oid (no `sha256:` prefix).
+    pub oid: String,
+    /// Object size in bytes. Authoritative for uploads; ignored for downloads
+    /// (the sha256 is the integrity check and the body streams to EOF).
+    pub size: u64,
+}
+
+/// The daemon's reply within an LFS transfer. The meaning of [`Self::Proceed`]
+/// depends on the phase (see the module-level protocol notes).
+#[derive(Debug, Serialize, Deserialize)]
+pub enum LfsResponse {
+    /// Download: bytes follow. Upload phase 1: send the body. Upload phase 2: stored.
+    Proceed,
+    /// Upload only: the object is already present; skip sending the body.
+    Have,
+    /// The transfer was refused or failed (unauthorized, missing, or mismatch).
+    Error(String),
 }

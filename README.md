@@ -16,7 +16,7 @@ Download the latest release from GitHub. Download the pre-compiled binaries for 
 
 ## Setup
 
-Add `git-iroh` and `git-remote-iroh` to your PATH. These are used by git, and you, to configure the daemon and to communicate with iroh-enabled git servers (remotes.) Access `git-iroh` through `git iroh <command>` on your command line.
+Add `git-iroh`, `git-remote-iroh`, and `git-lfs-iroh` to your PATH. These are used by git, and you, to configure the daemon and to communicate with iroh-enabled git servers (remotes.) Access `git-iroh` through `git iroh <command>` on your command line. `git-lfs-iroh` is the Git LFS transfer agent and only needs to be on your PATH if you use LFS (see the Git LFS section below.)
 
 `iroh-git-daemon` is used to serve git repositories on your computer. This is the long-running server that listens for incoming connections and deals with access control. For Windows users, there is an alternative daemon called `iroh-git-tray`; it provides a notification icon and rudimentary UI.
 
@@ -62,10 +62,34 @@ Revoke a member's access with `git iroh revoke <node_id>`. This removes the memb
 
 Stop sharing an entire repository with `git iroh stop <share_id>`, using the SHARE_ID shown in `git iroh list`. This works from any directory. Pass `--this` instead of a SHARE_ID to stop sharing the repository in the current directory, or `--all` to stop sharing every repository at once.
 
+## Git LFS
+
+[Git LFS](https://git-lfs.com/) is also supported. The small pointer files travel in the normal git pack, while the object contents move over a separate iroh channel. LFS is off by default. The repository owner enables LFS per repository and grants each member the LFS right explicitly.
+
+Grant a member the LFS right with `git iroh grant <node_id> --lfs` (append `--write` to also allow uploads), then turn on LFS serving for the repository with `git iroh lfs-enable`. The grant is what shares the repository; `lfs-enable` only toggles a repository you already share.
+
+	$ git iroh grant 877c36753fcc84f71f9f804010ab4d0941d0a88ab95c1afabc09d93c6be6712c --lfs --write
+	$ git iroh lfs-enable
+	LFS enabled for C:\repositories\my_repo
+
+The `--lfs` flag is additive, just like `--write`. Revoke it with `git iroh revoke <node_id> --lfs`, which removes only the LFS right and leaves clone and push access intact. Turn LFS back off for the whole repository with `git iroh lfs-disable`. `git iroh list` marks LFS-enabled repositories with `(LFS on)` and LFS-granted members with `+lfs`.
+
+On Windows, the tray exposes the same controls: the grant dialog has an "Allow Git LFS transfer" checkbox, and each shared repository's menu has a checkable "Share Git LFS objects" item that toggles the repository's LFS switch.
+
+On the cloning side, each clone has to be pointed at the iroh transfer agent once. Git LFS will not run a transfer agent named by a cloned repository (a safeguard against running arbitrary programs on clone), so this setting cannot be committed to the repository. Run `git iroh lfs-setup` in the clone:
+
+	$ git iroh lfs-setup
+
+After that, `git lfs pull`, `git lfs fetch`, and `git lfs push` transfer objects over the iroh remote as usual. The `git-lfs-iroh` binary must be on your PATH.
+
+The `git lfs pull/fetch/push` commands are sequential. LFS transfers run as a single agent process at a time. Running several at once would each claim your client identity and collide on the relay. If you need more speed, use the iroh specific version `git iroh lfs-pull` or `git iroh lfs-push`. These commands get their concurrency by fanning out over a single connection from one process.
+
+Run `git iroh lfs-pull` to fetch the objects referenced by HEAD that are missing locally and check them out, and `git iroh lfs-push` to upload referenced objects the daemon does not already have. Run `git iroh lfs-push` before `git push` so the receiver can resolve the pointers it is about to receive.
+
 ## Limitations
 
 All members see all refs. There is only per-repository access control. When a node is granted read or write access they can access all branches in the git repository.
 
-No LFS support at this time.
+There are no size limits. The repository can grow unbounded and fill your hard drive. The same goes for LFS objects. They can grow arbitrarily large and numerous.
 
 The daemon registers with [n0 computer](https://n0.computer/)'s default relay and discovery service.

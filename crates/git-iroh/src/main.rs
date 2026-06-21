@@ -1,13 +1,21 @@
 //! `git-iroh` - the human-facing porcelain, run as `git iroh <cmd>`.
 
 use std::path::Path;
+use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use iroh_git::config::{GrantOutcome, Grants};
 use iroh_git::identity::{self, Role};
-use iroh_git::share::{self, Revoked};
-use iroh_git::RepoId;
+use iroh_git::lfs::{self, Session, UploadOutcome};
+use iroh_git::share::{self, LfsToggle, RevokeWhat, Revoked};
+use iroh_git::{RepoId, Ticket};
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
+
+/// Concurrent object transfers for `lfs-pull`/`lfs-push`. This is in-process
+/// fan-out over one connection (one identity); see the LFS notes in `iroh_git::lfs`.
+const PARALLEL: usize = 8;
 
 #[derive(Parser)]
 #[command(name = "git-iroh", about = "Share git repositories over iroh", version)]
@@ -45,6 +53,11 @@ enum Cmd {
         /// with --write upgrades an existing member in place.
         #[arg(long)]
         write: bool,
+        /// Allow this node to transfer Git LFS objects (download; combine with
+        /// --write for upload). Requires the repo to have LFS enabled
+        /// (`git iroh lfs-enable`). Additive.
+        #[arg(long)]
+        lfs: bool,
         /// Optional nickname so you can tell friends apart in `list`.
         #[arg(long)]
         name: Option<String>,
@@ -53,13 +66,17 @@ enum Cmd {
     ///
     /// By default this removes the member (NODE_ID) from the repository in the
     /// current directory. Pass --all to remove them from every repository you
-    /// share, or --write to only revoke push access while keeping read access.
+    /// share, --write to only revoke push access, or --lfs to only revoke LFS
+    /// access (both keep read access intact).
     Revoke {
         /// The member's NODE_ID (from their `git iroh show-id`).
         node_id: String,
         /// Only revoke write (push) access, leaving read access intact.
         #[arg(long)]
         write: bool,
+        /// Only revoke LFS access, leaving clone/push access intact.
+        #[arg(long)]
+        lfs: bool,
         /// Apply to every repository you share, not just the current directory.
         #[arg(long)]
         all: bool,
@@ -81,6 +98,44 @@ enum Cmd {
     },
     /// List shared repositories and their authorized members.
     List,
+    /// Enable Git LFS transfer for the repository in the current directory.
+    ///
+    /// LFS is off by default for every shared repo. With it enabled, members you
+    /// grant `--lfs` can transfer objects over iroh.
+    LfsEnable,
+    /// Disable Git LFS transfer for the repository in the current directory.
+    LfsDisable,
+    /// Configure this repository to transfer Git LFS objects over iroh.
+    ///
+    /// Writes the local git config pointing Git LFS at the `git-lfs-iroh`
+    /// transfer agent. Run once per clone - the config can't be committed (Git
+    /// LFS refuses to run a transfer agent named by a cloned repo, for security).
+    /// Afterwards `git lfs pull`/`push` ride your iroh remote automatically.
+    LfsSetup,
+    /// Fetch missing Git LFS objects over iroh, then update the working tree.
+    ///
+    /// The iroh equivalent of `git lfs pull`: downloads the objects referenced by
+    /// the given refs (default: current HEAD) that are missing locally, with
+    /// concurrent transfers over a single connection, then checks them out.
+    LfsPull {
+        /// Remote to fetch from.
+        #[arg(long, default_value = "origin")]
+        remote: String,
+        /// Refs to consider (default: current HEAD).
+        refs: Vec<String>,
+    },
+    /// Upload Git LFS objects over iroh.
+    ///
+    /// The iroh equivalent of `git lfs push`: uploads the objects referenced by
+    /// the given refs (default: current HEAD); the daemon skips any it already
+    /// has. Run before `git push` so the receiver can resolve the pointers.
+    LfsPush {
+        /// Remote to push to.
+        #[arg(long, default_value = "origin")]
+        remote: String,
+        /// Refs to consider (default: current HEAD).
+        refs: Vec<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -90,10 +145,17 @@ fn main() -> Result<()> {
             println!("{}", secret.public());
         }
         Cmd::Keygen { client, server, force } => keygen(client, server, force)?,
-        Cmd::Grant { node_id, write, name } => grant(&node_id, write, name.as_deref().unwrap_or(""))?,
-        Cmd::Revoke { node_id, write, all } => revoke(&node_id, write, all)?,
+        Cmd::Grant { node_id, write, lfs, name } => {
+            grant(&node_id, write, lfs, name.as_deref().unwrap_or(""))?
+        }
+        Cmd::Revoke { node_id, write, lfs, all } => revoke(&node_id, write, lfs, all)?,
         Cmd::Stop { share_id, this, all } => stop(share_id.as_deref(), this, all)?,
         Cmd::List => list()?,
+        Cmd::LfsEnable => lfs_enable()?,
+        Cmd::LfsDisable => lfs_disable()?,
+        Cmd::LfsSetup => lfs_setup()?,
+        Cmd::LfsPull { remote, refs } => lfs_pull(&remote, &refs)?,
+        Cmd::LfsPush { remote, refs } => lfs_push(&remote, &refs)?,
     }
     Ok(())
 }
@@ -126,8 +188,8 @@ fn keygen(client: bool, server: bool, force: bool) -> Result<()> {
     Ok(())
 }
 
-fn grant(node_id: &str, write: bool, name: &str) -> Result<()> {
-    let g = share::grant(Path::new("."), node_id, write, name)?;
+fn grant(node_id: &str, write: bool, lfs: bool, name: &str) -> Result<()> {
+    let g = share::grant(Path::new("."), node_id, write, lfs, name)?;
     match g.outcome {
         GrantOutcome::Added => eprintln!("granted read-only access to {}", g.repo_path),
         GrantOutcome::AddedWrite => eprintln!("granted read-write access to {}", g.repo_path),
@@ -135,34 +197,63 @@ fn grant(node_id: &str, write: bool, name: &str) -> Result<()> {
             eprintln!("upgraded {} to read-write - their existing remote is unchanged", g.node_id)
         }
         GrantOutcome::Unchanged => {
-            eprintln!("{} already has access - their existing remote is unchanged", g.node_id)
+            // Only claim nothing changed when LFS didn't change either.
+            if !g.lfs_added {
+                eprintln!("{} already has access - their existing remote is unchanged", g.node_id);
+            }
+        }
+    }
+    if lfs {
+        if g.lfs_added {
+            eprintln!("granted LFS access to {}", g.node_id);
+        } else {
+            eprintln!("{} already had LFS access", g.node_id);
+        }
+        if !g.lfs_enabled {
+            eprintln!(
+                "note: LFS isn't enabled on this repository yet - run `git iroh lfs-enable` so members can use it"
+            );
         }
     }
     println!("{}", g.ticket.encode());
     Ok(())
 }
 
-fn revoke(node_id: &str, write_only: bool, all: bool) -> Result<()> {
+fn revoke(node_id: &str, write_only: bool, lfs_only: bool, all: bool) -> Result<()> {
+    if write_only && lfs_only {
+        bail!("pass only one of --write or --lfs");
+    }
+    let what = if write_only {
+        RevokeWhat::Write
+    } else if lfs_only {
+        RevokeWhat::Lfs
+    } else {
+        RevokeWhat::Member
+    };
     let node = share::canonical_node_id(node_id)?;
 
     if all {
-        let n = share::revoke_everywhere(node_id, write_only)?;
-        match (n, write_only) {
-            (0, true) => eprintln!("{node} had no write access to revoke in any repository"),
-            (0, false) => eprintln!("{node} was not a member of any repository"),
-            (n, true) => eprintln!("revoked write access for {node} in {}", repos(n)),
-            (n, false) => eprintln!("revoked all access for {node} in {}", repos(n)),
+        let n = share::revoke_everywhere(node_id, what)?;
+        match (n, what) {
+            (0, RevokeWhat::Write) => eprintln!("{node} had no write access to revoke in any repository"),
+            (0, RevokeWhat::Lfs) => eprintln!("{node} had no LFS access to revoke in any repository"),
+            (0, RevokeWhat::Member) => eprintln!("{node} was not a member of any repository"),
+            (n, RevokeWhat::Write) => eprintln!("revoked write access for {node} in {}", repos(n)),
+            (n, RevokeWhat::Lfs) => eprintln!("revoked LFS access for {node} in {}", repos(n)),
+            (n, RevokeWhat::Member) => eprintln!("revoked all access for {node} in {}", repos(n)),
         }
         return Ok(());
     }
 
     let repo_path = share::resolve_repo(Path::new("."))?;
-    match share::revoke_at(&repo_path, node_id, write_only)? {
+    match share::revoke_at(&repo_path, node_id, what)? {
         Revoked::RemovedMember => eprintln!("revoked all access for {node}"),
         Revoked::DowngradedToReadOnly => {
             eprintln!("revoked write access for {node} (still read-only)")
         }
         Revoked::AlreadyReadOnly => eprintln!("{node} already had read-only access"),
+        Revoked::LfsRevoked => eprintln!("revoked LFS access for {node}"),
+        Revoked::AlreadyNoLfs => eprintln!("{node} already had no LFS access"),
         Revoked::NotAMember => bail!("{node} was not granted access to this repository"),
         Revoked::RepoNotShared => bail!("this repository isn't shared"),
     }
@@ -220,18 +311,224 @@ fn list() -> Result<()> {
         return Ok(());
     }
     for repo in &grants.repos {
-        println!("{}  [{}]", repo.path, repo.id);
+        let lfs = if repo.lfs_enabled { "  (LFS on)" } else { "" };
+        println!("{}  [{}]{lfs}", repo.path, repo.id);
         if repo.members.is_empty() {
             println!("    (no members)");
         }
         for m in &repo.members {
             let mode = if m.allow_push { "rw" } else { "ro" };
+            let lfs = if m.allow_lfs { " +lfs" } else { "" };
             if m.nickname.is_empty() {
-                println!("    {mode}  {}", m.node_id);
+                println!("    {mode}{lfs}  {}", m.node_id);
             } else {
-                println!("    {mode}  {}  ({})", m.nickname, m.node_id);
+                println!("    {mode}{lfs}  {}  ({})", m.nickname, m.node_id);
             }
         }
     }
     Ok(())
+}
+
+fn lfs_enable() -> Result<()> {
+    let (repo, outcome) = share::set_repo_lfs(Path::new("."), true)?;
+    match outcome {
+        LfsToggle::Enabled => {
+            println!("LFS enabled for {repo}");
+            eprintln!("grant members LFS access with `git iroh grant <node_id> --lfs [--write]`");
+        }
+        LfsToggle::AlreadyInThatState => println!("LFS already enabled for {repo}"),
+        LfsToggle::NotShared => {
+            bail!("{repo} isn't shared yet; grant someone access first (e.g. `git iroh grant <node_id> --lfs`)")
+        }
+        LfsToggle::Disabled => unreachable!("enable path"),
+    }
+    Ok(())
+}
+
+fn lfs_disable() -> Result<()> {
+    let (repo, outcome) = share::set_repo_lfs(Path::new("."), false)?;
+    match outcome {
+        LfsToggle::Disabled => println!("LFS disabled for {repo}"),
+        LfsToggle::AlreadyInThatState => println!("LFS already disabled for {repo}"),
+        LfsToggle::NotShared => println!("{repo} isn't shared; nothing to disable"),
+        LfsToggle::Enabled => unreachable!("disable path"),
+    }
+    Ok(())
+}
+
+fn lfs_setup() -> Result<()> {
+    let repo = std::env::current_dir().context("getting current directory")?;
+    let agent = agent_path();
+
+    run_git(&repo, &["config", "--local", "lfs.standalonetransferagent", "iroh"])?;
+    run_git(&repo, &["config", "--local", "lfs.customtransfer.iroh.path", &agent])?;
+    // One agent process, one connection: with `concurrent = true` Git LFS would
+    // spawn several agent processes, each binding the client identity and
+    // colliding on the relay. `git iroh lfs-pull/push` does its own in-process
+    // fan-out for speed instead.
+    run_git(&repo, &["config", "--local", "lfs.customtransfer.iroh.concurrent", "false"])?;
+
+    println!("configured Git LFS to transfer objects over iroh");
+    println!("  agent: {agent}");
+    println!("`git lfs pull`/`push` will now ride your iroh remote.");
+    Ok(())
+}
+
+fn lfs_pull(remote: &str, refs: &[String]) -> Result<()> {
+    let repo = std::env::current_dir().context("getting current directory")?;
+    let ticket = resolve_ticket(&repo, remote)?;
+    let store = lfs::object_store(&repo)?;
+
+    let missing: Vec<String> = lfs::referenced_oids(&repo, refs)?
+        .into_iter()
+        .filter(|oid| !lfs::object_path(&store, oid).exists())
+        .collect();
+
+    if missing.is_empty() {
+        println!("LFS: all referenced objects already present");
+    } else {
+        println!("LFS: fetching {} object(s) over iroh...", missing.len());
+        let (done, failures) = runtime()?.block_on(async {
+            let session = Session::connect(&ticket).await?;
+            let store = store.clone();
+            let result = fan_out(&session, missing, move |s, oid| {
+                let store = store.clone();
+                async move { s.download(&oid, &lfs::object_path(&store, &oid)).await }
+            })
+            .await;
+            session.close().await;
+            anyhow::Ok(result)
+        })?;
+
+        for (oid, err) in &failures {
+            eprintln!("  failed {oid}: {err:#}");
+        }
+        println!("LFS: fetched {} object(s)", done.len());
+        if !failures.is_empty() {
+            bail!("{} LFS object(s) failed to download", failures.len());
+        }
+    }
+
+    // Smudge the working tree from the now-complete local store.
+    run_git(&repo, &["lfs", "checkout"])?;
+    Ok(())
+}
+
+fn lfs_push(remote: &str, refs: &[String]) -> Result<()> {
+    let repo = std::env::current_dir().context("getting current directory")?;
+    let ticket = resolve_ticket(&repo, remote)?;
+    let store = lfs::object_store(&repo)?;
+
+    // Only push objects we actually have. A normal clone references LFS objects it
+    // hasn't fetched yet (pointers only); those aren't ours to push, so skip them
+    // rather than reporting them as failures.
+    let (present, missing): (Vec<String>, Vec<String>) = lfs::referenced_oids(&repo, refs)?
+        .into_iter()
+        .partition(|oid| lfs::object_path(&store, oid).exists());
+    if !missing.is_empty() {
+        println!("LFS: skipping {} referenced object(s) not present in the local store", missing.len());
+    }
+    if present.is_empty() {
+        println!("LFS: no local objects to push");
+        return Ok(());
+    }
+
+    println!("LFS: pushing {} object(s) over iroh...", present.len());
+    let (done, failures) = runtime()?.block_on(async {
+        let session = Session::connect(&ticket).await?;
+        let store = store.clone();
+        let result = fan_out(&session, present, move |s, oid| {
+            let store = store.clone();
+            async move {
+                let path = lfs::object_path(&store, &oid);
+                let size = std::fs::metadata(&path)?.len();
+                s.upload(&oid, size, &path).await
+            }
+        })
+        .await;
+        session.close().await;
+        anyhow::Ok(result)
+    })?;
+
+    for (oid, err) in &failures {
+        eprintln!("  failed {oid}: {err:#}");
+    }
+    let uploaded = done.iter().filter(|(_, o)| *o == UploadOutcome::Uploaded).count();
+    let skipped = done.len() - uploaded;
+    println!("LFS: uploaded {uploaded}, already present {skipped}");
+    if !failures.is_empty() {
+        bail!("{} LFS object(s) failed to upload", failures.len());
+    }
+    Ok(())
+}
+
+/// Run `op` for each oid concurrently over the shared `session`, with at most
+/// PARALLEL transfers in flight. Returns the successes (oid + result) and the
+/// per-oid failures. This is the in-process fan-out over one connection (one
+/// identity) shared by `lfs-pull` and `lfs-push`.
+async fn fan_out<T, F, Fut>(
+    session: &Session,
+    oids: Vec<String>,
+    op: F,
+) -> (Vec<(String, T)>, Vec<(String, anyhow::Error)>)
+where
+    T: Send + 'static,
+    F: Fn(Session, String) -> Fut,
+    Fut: std::future::Future<Output = Result<T>> + Send + 'static,
+{
+    let sem = Arc::new(Semaphore::new(PARALLEL));
+    let mut set = JoinSet::new();
+    for oid in oids {
+        let sem = sem.clone();
+        let task = op(session.clone(), oid.clone());
+        set.spawn(async move {
+            let _permit = sem.acquire_owned().await.expect("semaphore not closed");
+            (oid, task.await)
+        });
+    }
+
+    let (mut done, mut failures) = (Vec::new(), Vec::new());
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok((oid, Ok(v))) => done.push((oid, v)),
+            Ok((oid, Err(e))) => failures.push((oid, e)),
+            Err(e) => failures.push(("<task>".to_string(), anyhow!("join error: {e}"))),
+        }
+    }
+    (done, failures)
+}
+
+/// Resolve a remote name (or `iroh://` URL) to its parsed ticket.
+fn resolve_ticket(repo: &Path, remote: &str) -> Result<Ticket> {
+    let url = lfs::resolve_remote_url(repo, remote)?;
+    Ticket::parse(&url)
+        .with_context(|| format!("remote {remote:?} is not an iroh:// remote (url: {url})"))
+}
+
+/// Absolute path to the `git-lfs-iroh` binary shipped next to this one, so the
+/// configured transfer agent resolves regardless of the working directory.
+fn agent_path() -> String {
+    let exe = format!("git-lfs-iroh{}", std::env::consts::EXE_SUFFIX);
+    match std::env::current_exe() {
+        Ok(p) => p.with_file_name(&exe).to_string_lossy().into_owned(),
+        Err(_) => exe, // fall back to the bare name (relies on PATH)
+    }
+}
+
+/// Run `git -C <repo> <args>`, failing on non-zero exit.
+fn run_git(repo: &Path, args: &[&str]) -> Result<()> {
+    let mut cmd = iroh_git::paths::git_command(repo);
+    cmd.args(args);
+    let status = cmd.status().with_context(|| format!("running git {}", args.join(" ")))?;
+    if !status.success() {
+        bail!("git {} failed", args.join(" "));
+    }
+    Ok(())
+}
+
+fn runtime() -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("building tokio runtime")
 }

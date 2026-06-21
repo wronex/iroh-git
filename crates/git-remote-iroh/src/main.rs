@@ -9,9 +9,7 @@
 use std::env;
 
 use anyhow::{bail, Context, Result};
-use iroh::endpoint::presets;
-use iroh::{Endpoint, EndpointAddr, RelayUrl};
-use iroh_git::identity::{self, Role};
+use iroh::endpoint::ConnectionError;
 use iroh_git::protocol::{self, Request, Response, Service, VERSION};
 use iroh_git::{Ticket, ALPN};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Stdin, Stdout};
@@ -68,23 +66,8 @@ async fn connect_and_relay(
     mut git_in: BufReader<Stdin>,
     mut git_out: Stdout,
 ) -> Result<()> {
-    let secret = identity::load_or_create(Role::Client)?;
-    let endpoint = Endpoint::builder(presets::N0)
-        .secret_key(secret)
-        .bind()
-        .await
-        .map_err(|e| anyhow::anyhow!("binding endpoint: {e}"))?;
-
-    let mut addr = EndpointAddr::new(ticket.node_id);
-    if let Some(relay) = &ticket.relay_url {
-        let relay: RelayUrl = relay.parse().context("ticket relay url")?;
-        addr = addr.with_relay_url(relay);
-    }
-
-    let conn = endpoint
-        .connect(addr, ALPN)
-        .await
-        .map_err(|e| anyhow::anyhow!("connecting to daemon: {e}"))?;
+    // Keep `_endpoint` bound: dropping it would close the connection.
+    let (_endpoint, conn) = iroh_git::dial(&ticket, ALPN).await?;
     let (mut send, mut recv) = conn
         .open_bi()
         .await
@@ -127,7 +110,18 @@ async fn connect_and_relay(
         Ok::<_, anyhow::Error>(())
     };
 
-    tokio::try_join!(up, down)?;
+    if let Err(e) = tokio::try_join!(up, down) {
+        // If the daemon closed the connection with an application reason - e.g. a
+        // mid-session revoke (`access revoked`) - surface it, since git otherwise
+        // shows only a generic "connection reset".
+        if let Some(ConnectionError::ApplicationClosed(ac)) = conn.close_reason() {
+            let reason = String::from_utf8_lossy(ac.reason.as_ref());
+            if !reason.trim().is_empty() {
+                bail!("remote: {reason}");
+            }
+        }
+        return Err(e);
+    }
     Ok(())
 }
 

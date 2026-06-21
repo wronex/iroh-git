@@ -11,7 +11,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use iroh::SecretKey;
 use zeroize::Zeroize;
 
@@ -52,26 +52,21 @@ pub fn load_or_create(role: Role) -> Result<SecretKey> {
         let mut bytes = fs::read(&path).with_context(|| format!("reading key {}", path.display()))?;
         // Defensively tighten perms in case an older build wrote the key world-readable.
         restrict_file(&path);
-        let mut seed: [u8; 32] = bytes
-            .as_slice()
-            .try_into()
-            .with_context(|| format!("key {} is not 32 bytes", path.display()))?;
+        let mut seed: [u8; 32] = match bytes.as_slice().try_into() {
+            Ok(seed) => seed,
+            Err(_) => {
+                // Wipe the key material even on the error path before bailing.
+                bytes.zeroize();
+                bail!("key {} is not 32 bytes", path.display());
+            }
+        };
         let secret = SecretKey::from_bytes(&seed);
         // Wipe the transient copies; the live key lives on inside `secret`.
         seed.zeroize();
         bytes.zeroize();
         Ok(secret)
     } else {
-        let mut seed = [0u8; 32];
-        getrandom::getrandom(&mut seed)
-            .map_err(|e| anyhow::anyhow!("gathering randomness for a new key: {e}"))?;
-        let secret = SecretKey::from_bytes(&seed);
-        seed.zeroize();
-        let mut out = secret.to_bytes();
-        let result = write_secret(&path, &out);
-        out.zeroize();
-        result?;
-        Ok(secret)
+        mint(&path)
     }
 }
 
@@ -87,14 +82,20 @@ pub fn generate(role: Role) -> Result<SecretKey> {
         .with_context(|| format!("creating config directory {}", dir.display()))?;
     restrict_dir(&dir);
     let path = dir.join(role.filename());
+    mint(&path)
+}
 
+/// Generate a fresh secret key, write it to `path`, and wipe the transient
+/// copies (the live key lives on inside the returned `SecretKey`). The caller is
+/// responsible for having created and restricted the parent directory.
+fn mint(path: &Path) -> Result<SecretKey> {
     let mut seed = [0u8; 32];
     getrandom::getrandom(&mut seed)
         .map_err(|e| anyhow::anyhow!("gathering randomness for a new key: {e}"))?;
     let secret = SecretKey::from_bytes(&seed);
     seed.zeroize();
     let mut out = secret.to_bytes();
-    let result = write_secret(&path, &out);
+    let result = write_secret(path, &out);
     out.zeroize();
     result?;
     Ok(secret)
