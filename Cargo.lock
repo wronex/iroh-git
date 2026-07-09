@@ -1131,7 +1131,7 @@ dependencies = [
 
 [[package]]
 name = "git-iroh"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1142,7 +1142,7 @@ dependencies = [
 
 [[package]]
 name = "git-lfs-iroh"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "iroh-git",
@@ -1152,7 +1152,7 @@ dependencies = [
 
 [[package]]
 name = "git-remote-iroh"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "iroh",
@@ -1761,7 +1761,7 @@ dependencies = [
 
 [[package]]
 name = "iroh-git"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "data-encoding",
@@ -1780,7 +1780,7 @@ dependencies = [
 
 [[package]]
 name = "iroh-git-daemon"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1792,7 +1792,7 @@ dependencies = [
 
 [[package]]
 name = "iroh-git-tray"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "embed-manifest",
