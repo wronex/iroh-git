@@ -15,7 +15,8 @@ pub mod share;
 pub mod ticket;
 
 use anyhow::{Context, Result};
-use iroh::endpoint::{presets, Connection};
+use iroh::address_lookup::DnsAddressLookup;
+use iroh::endpoint::{default_relay_mode, presets, Connection};
 use iroh::{Endpoint, EndpointAddr, RelayUrl};
 
 use crate::identity::Role;
@@ -39,7 +40,14 @@ pub const LFS_ALPN: &[u8] = b"iroh-git-lfs/0";
 /// helper (pack) and [`lfs::Session`] (LFS) so the relay/identity wiring lives once.
 pub async fn dial(ticket: &Ticket, alpn: &[u8]) -> Result<(Endpoint, Connection)> {
     let secret = identity::load_or_create(Role::Client)?;
-    let endpoint = Endpoint::builder(presets::N0)
+    // Not presets::N0: that would add a PkarrPublisher announcing this client's
+    // address record to n0's DNS service on every dial. Nothing ever dials the
+    // client, so publish nothing. Keep the DNS *resolver* (fallback for tickets
+    // without a relay hint) and the default relay mode (the dial reaches the
+    // daemon through the relay named in the ticket).
+    let endpoint = Endpoint::builder(presets::Minimal)
+        .address_lookup(DnsAddressLookup::n0_dns())
+        .relay_mode(default_relay_mode())
         .secret_key(secret)
         .bind()
         .await

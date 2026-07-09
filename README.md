@@ -92,4 +92,4 @@ All members see all refs. There is only per-repository access control. When a no
 
 There are no size limits. The repository can grow unbounded and fill your hard drive. The same goes for LFS objects. They can grow arbitrarily large and numerous.
 
-The daemon registers with [n0 computer](https://n0.computer/)'s default relay and discovery service.
+The daemon homes on [n0 computer](https://n0.computer/)'s default relay and publishes its address record to n0's DNS service (`iroh.link`), so it can be found even when a ticket carries no relay hint. The dialing client registers nowhere: it contacts the daemon through the relay named in the ticket and only falls back to a DNS lookup if the hint is missing. No DHT is involved on either side.
