@@ -13,6 +13,8 @@ use iroh_git::{RepoId, Ticket};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
+mod lfs_hook;
+
 /// Concurrent object transfers for `lfs-pull`/`lfs-push`. This is in-process
 /// fan-out over one connection (one identity); see the LFS notes in `iroh_git::lfs`.
 const PARALLEL: usize = 8;
@@ -112,6 +114,17 @@ enum Cmd {
     /// LFS refuses to run a transfer agent named by a cloned repo, for security).
     /// Afterwards `git lfs pull`/`push` ride your iroh remote automatically.
     LfsSetup,
+    /// Stop the git-lfs pre-push hook from stalling pushes to iroh remotes.
+    ///
+    /// `git lfs install` leaves a hook that runs for every remote, and git-lfs
+    /// cannot parse `iroh://` URLs - it reads the scheme as an SSH hostname and
+    /// retries a doomed `ssh iroh` several times, adding ~20 s to every push
+    /// (even in a repository that tracks no LFS files at all). This inserts one
+    /// line at the top of that hook so it skips iroh remotes it has no way to
+    /// transfer over; a repository set up with `lfs-setup` still runs git-lfs,
+    /// as does every non-iroh remote. Idempotent, and it never touches a hook
+    /// that isn't git-lfs's.
+    GuardLfsHook,
     /// Fetch missing Git LFS objects over iroh, then update the working tree.
     ///
     /// The iroh equivalent of `git lfs pull`: downloads the objects referenced by
@@ -154,6 +167,7 @@ fn main() -> Result<()> {
         Cmd::LfsEnable => lfs_enable()?,
         Cmd::LfsDisable => lfs_disable()?,
         Cmd::LfsSetup => lfs_setup()?,
+        Cmd::GuardLfsHook => guard_lfs_hook()?,
         Cmd::LfsPull { remote, refs } => lfs_pull(&remote, &refs)?,
         Cmd::LfsPush { remote, refs } => lfs_push(&remote, &refs)?,
     }
@@ -374,6 +388,28 @@ fn lfs_setup() -> Result<()> {
     Ok(())
 }
 
+/// Insert the iroh guard into this repository's git-lfs pre-push hook.
+fn guard_lfs_hook() -> Result<()> {
+    let repo = std::env::current_dir().context("getting current directory")?;
+    match lfs_hook::guard(&repo)? {
+        (lfs_hook::Outcome::Added, Some(hook)) => {
+            println!("guarded {}", hook.display());
+            println!("iroh:// pushes now skip git-lfs unless `git iroh lfs-setup` has run here;");
+            println!("every other remote is unchanged.");
+        }
+        (lfs_hook::Outcome::AlreadyGuarded, _) => println!("already guarded; nothing to do."),
+        (lfs_hook::Outcome::NothingToDo, Some(hook)) => {
+            println!("left {} alone: it doesn't run git-lfs.", hook.display())
+        }
+        (lfs_hook::Outcome::NothingToDo, None) => {
+            println!("no pre-push hook here; nothing to guard.")
+        }
+        // `Added` always carries the hook it acted on.
+        (lfs_hook::Outcome::Added, None) => unreachable!("a guarded hook has a path"),
+    }
+    Ok(())
+}
+
 fn lfs_pull(remote: &str, refs: &[String]) -> Result<()> {
     let repo = std::env::current_dir().context("getting current directory")?;
     let ticket = resolve_ticket(&repo, remote)?;
@@ -411,6 +447,7 @@ fn lfs_pull(remote: &str, refs: &[String]) -> Result<()> {
 
     // Smudge the working tree from the now-complete local store.
     run_git(&repo, &["lfs", "checkout"])?;
+    lfs_hook::warn_if_unguarded(&repo);
     Ok(())
 }
 
@@ -430,6 +467,7 @@ fn lfs_push(remote: &str, refs: &[String]) -> Result<()> {
     }
     if present.is_empty() {
         println!("LFS: no local objects to push");
+        lfs_hook::warn_if_unguarded(&repo);
         return Ok(());
     }
 
@@ -459,6 +497,8 @@ fn lfs_push(remote: &str, refs: &[String]) -> Result<()> {
     if !failures.is_empty() {
         bail!("{} LFS object(s) failed to upload", failures.len());
     }
+    // The next step is `git push`, which is exactly where the hook bites.
+    lfs_hook::warn_if_unguarded(&repo);
     Ok(())
 }
 

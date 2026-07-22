@@ -48,6 +48,19 @@ Now you can push and pull using git as you normally would.
 
 Keep in mind that git does not like when you push to a checked out branch. This can be configured and git will show a nice error message if you try. It is recommended to use bare repositories as your remote though. Or, you will need to figure out how to only push to non-checked out branches.
 
+## If you have Git LFS installed
+
+If pushing to an iroh remote takes a long time (twenty seconds or more) there might be an LFS hook that is causing issues.
+
+`git lfs install` leaves a `pre-push` hook in every repository, and that hook runs for *every* remote. Git LFS cannot parse an `iroh://` URL: it reads the unknown scheme as an SSH-style one, takes `iroh` for a hostname, and runs `ssh iroh git-lfs-transfer ...`, which fails after a few retries.
+
+Run `git iroh guard-lfs-hook` in the clone to defuse it:
+
+	$ git iroh guard-lfs-hook
+	guarded C:\repositories\my_repo\.git\hooks\pre-push
+	iroh:// pushes now skip git-lfs unless `git iroh lfs-setup` has run here;
+	every other remote is unchanged.
+
 ## Access control
 
 Use `git iroh list` to see shared repositories:
@@ -92,6 +105,6 @@ All members see all refs. There is only per-repository access control. When a no
 
 There are no size limits. The repository can grow unbounded and fill your hard drive. The same goes for LFS objects. They can grow arbitrarily large and numerous.
 
-Access control protects the server, not the cloner. Whoever issued the ticket controls every byte of repository content you receive, so cloning a ticket means the same thing as cloning any other untrusted remote. Git's worst client-side vulnerabilities (CVE-2018-11235, CVE-2019-19604, CVE-2024-32002) are all triggered by recursive submodule clones from a hostile repository. Do not use `--recurse-submodules`, and do not run hooks or build scripts, on a ticket you do not fully trust. Keep your git client up to date.
+Access control protects the server, not the cloner. Whoever issued the ticket controls every byte of repository content you receive, so cloning a ticket means the same thing as cloning any other untrusted remote. Git's worst client-side vulnerabilities (CVE-2018-11235, CVE-2019-19604, CVE-2024-32002) are all triggered by recursive submodule clones from a hostile repository. Do not use `--recurse-submodules` and do not run hooks or build scripts on a ticket you do not fully trust. Keep your git client up to date.
 
 The daemon homes on [n0 computer](https://n0.computer/)'s default relay and publishes its address record to n0's DNS service (`iroh.link`), so it can be found even when a ticket carries no relay hint. The dialing client registers nowhere: it contacts the daemon through the relay named in the ticket and only falls back to a DNS lookup if the hint is missing. No DHT is involved on either side.
